@@ -56,6 +56,7 @@ class ImportResult:
 def read_rows(source: TextIO) -> Iterator[tuple[int, list[str]]]:
     reader = csv.reader(source, strict=True)
     while True:
+        # A quoted field can span multiple lines, so record where the row starts.
         line_number = reader.line_num + 1
         try:
             row = next(reader)
@@ -85,6 +86,7 @@ def parse_item(row: list[str], columns: tuple[int, ...]) -> Item:
 
 
 def store_item(connection: sqlite3.Connection, item: Item) -> bool:
+    """Insert an item, or return False if the same item is already stored."""
     existing = connection.execute(
         "SELECT name, quantity FROM items WHERE item_id = ?", (item.item_id,)
     ).fetchone()
@@ -120,16 +122,22 @@ def load_csv(input_path: Path, database: Path) -> ImportResult:
                 if not row:
                     continue
                 try:
-                    added = store_item(connection, parse_item(row, columns))
+                    item = parse_item(row, columns)
+                    was_inserted = store_item(connection, item)
                 except ValueError as error:
+                    row_json = json.dumps(row, ensure_ascii=False)
                     connection.execute(
-                        "INSERT INTO rejections VALUES (?, ?, ?, ?)",
-                        (run_id, line_number, str(error), json.dumps(row, ensure_ascii=False)),
+                        "INSERT INTO rejections (run_id, line_number, reason, row_json) "
+                        "VALUES (?, ?, ?, ?)",
+                        (run_id, line_number, str(error), row_json),
                     )
                     rejected += 1
+                    continue
+
+                if was_inserted:
+                    inserted += 1
                 else:
-                    inserted += added
-                    unchanged += not added
+                    unchanged += 1
 
             connection.execute(
                 "UPDATE import_runs SET inserted = ?, unchanged = ?, rejected = ? WHERE id = ?",
@@ -139,28 +147,32 @@ def load_csv(input_path: Path, database: Path) -> ImportResult:
 
 
 def write_report(database: Path, run_id: int, output: Path) -> None:
-    """Write the rejection CSV atomically, using the committed import audit."""
-    uri = f"{database.resolve().as_uri()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as connection:
-        if connection.execute("SELECT 1 FROM import_runs WHERE id = ?", (run_id,)).fetchone() is None:
+    """Export rejected rows from a saved import."""
+    database_uri = f"{database.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(database_uri, uri=True)) as connection:
+        run = connection.execute("SELECT id FROM import_runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None:
             raise ValueError(f"Import run {run_id} was not found.")
-        rejections = connection.execute(
-            "SELECT line_number, reason, row_json FROM rejections WHERE run_id = ? ORDER BY line_number",
+        rejection_rows = connection.execute(
+            "SELECT line_number, reason, row_json FROM rejections "
+            "WHERE run_id = ? ORDER BY line_number",
             (run_id,),
         )
-        temporary = None
+
+        # Replace the destination only after the whole report has been written.
+        temporary_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", newline="", dir=output.parent, delete=False
             ) as handle:
-                temporary = Path(handle.name)
+                temporary_path = Path(handle.name)
                 writer = csv.writer(handle)
                 writer.writerow(("line_number", "reason", "row_json"))
-                writer.writerows(rejections)
-            os.replace(temporary, output)
+                writer.writerows(rejection_rows)
+            os.replace(temporary_path, output)
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 def require_distinct_paths(*paths: Path) -> None:
@@ -188,7 +200,9 @@ def main() -> int:
             print(f"Wrote rejection report for import {args.run_id} to {args.out}")
             return 0
 
-        paths = (args.input, args.db) if args.rejects is None else (args.input, args.db, args.rejects)
+        paths = [args.input, args.db]
+        if args.rejects is not None:
+            paths.append(args.rejects)
         require_distinct_paths(*paths)
         result = load_csv(args.input, args.db)
         print(
