@@ -4,6 +4,13 @@
 
 A command-line tool that validates an inventory CSV, imports valid items into SQLite, and records why each rejected row failed. It uses the Python 3.10+ standard library and includes a synthetic dataset for a local demo.
 
+## Design decisions
+
+- **Repeatable imports:** identical item IDs and values are unchanged; conflicting values are rejected rather than silently overwriting inventory.
+- **Atomic database changes:** valid items, rejection records, and the run summary commit together. Broken CSV syntax rolls the whole run back.
+- **Recoverable reports:** CSV export happens after commit. A failed export can be regenerated from the stored rejection records without importing again.
+- **Small deployment footprint:** Python's standard library and SQLite keep the example runnable without a server or third-party packages.
+
 ## Run the demo
 
 From the repository root, run the sample twice against a fresh temporary database.
@@ -85,3 +92,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests exercise the command line with temporary files and databases. They cover duplicate imports, conflicting IDs, malformed records, a broken file, concurrent imports, and report recovery. The `items` table stores the current inventory. `import_runs` and `rejections` preserve the audit trail.
+
+## Read the code
+
+- [import_validator.py](import_validator.py): CLI, CSV validation, database transaction, and report export.
+- [tests/test_import_validator.py](tests/test_import_validator.py): eight tests that run the CLI against temporary databases and files.
+- [examples](examples): synthetic valid and malformed inputs used in the demo above.
+
+This is a local inventory-import tool. It does not provide a web service, authentication, or a distributed ingestion pipeline.
